@@ -1,6 +1,5 @@
 import base64
 import os
-import socket
 import ssl
 import struct
 import threading
@@ -21,7 +20,7 @@ def env(name: str, default: str = "") -> str:
 # EcoFlow account
 EMAIL         = env("ECOFLOW_USERNAME")
 PASSWORD      = env("ECOFLOW_PASSWORD")
-API_BASE_URL  = env("ECOFLOW_API_BASE_URL", "https://api.ecoflow.com")
+API_BASE_URL  = env("ECOFLOW_API_BASE_URL", "https://api-e.ecoflow.com")
 
 # Device: EcoFlow serial number ("device id") and max wattage for ups.load %
 DEVICE_SN     = env("ECOFLOW_DEVICE_ID")
@@ -29,13 +28,13 @@ NUT_UPS_NAME  = env("NUT_UPS_NAME", "ecoflow-ups")
 MAX_WATTS     = int(env("ECOFLOW_MAX_WATTS", "300"))
 
 # Where the simulated Android device UUID is persisted (volume-mounted in Docker)
-DEVICE_UUID_FILE = env("ECOFLOW_DEVICE_UUID_FILE", os.path.expanduser("~/.ecoflow_device_id"))
+DEVICE_UUID_FILE = env("ECOFLOW_DEVICE_UUID_FILE", "/data/ecoflow_device_id")
 
-# NUT upsd TCP connection settings
-NUT_HOST     = env("NUT_HOST", "127.0.0.1")
-NUT_PORT     = int(env("NUT_PORT", "3493"))
-NUT_USER     = env("NUT_USERNAME")
-NUT_PASSWORD = env("NUT_PASSWORD")
+# Path to the dummy-ups definition file the bridge feeds by rewriting.
+# The dummy-ups driver re-reads this file whenever its timestamp changes
+# (dummy-once mode). This replaces the previous SET VAR approach, which
+# Alpine's dummy-ups build rejects with ERR READONLY.
+NUT_DEV_FILE = env("NUT_DEV_FILE", f"/etc/nut/{NUT_UPS_NAME}.dev")
 
 # Low battery threshold (%) to trigger OB LB (On Battery + Low Battery) for graceful server shutdown
 LOW_BATTERY_PCT = int(env("LOW_BATTERY_PCT", "20"))
@@ -51,46 +50,47 @@ UPS_MAPPING = { DEVICE_SN: {"nut_name": NUT_UPS_NAME, "max_watts": MAX_WATTS } }
 DEVICE_STATES = {sn: {} for sn in UPS_MAPPING}
 
 # ==========================================
-# NUT TCP CLIENT (Port 3493)
+# DUMMY-UPS STATE WRITER
 # ==========================================
-class NutTcpClient:
-    def __init__(self, host: str, port: int, username: str, password: str):
-        self.host = host
-        self.port = port
-        self.username = username
-        self.password = password
-        self.sock = None
+# dummy-ups reads "variable: value" lines from the .dev definition file.
+# In dummy-once mode it re-reads the file only when its mtime changes, so
+# every update must (a) contain the full desired state, and (b) touch the
+# timestamp. Writes are atomic (tmp file + rename) so the driver never sees
+# a half-written file.
+IDENTITY_VARS = {
+    "device.mfr": "Ecoflow",
+    "device.model": "River 3 UPS",
+    "ups.mfr": "Ecoflow",
+    "ups.model": "River 3 UPS",
+}
 
-    def connect(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-        self.sock = socket.create_connection((self.host, self.port), timeout=5)
-        self._send_cmd(f"USERNAME {self.username}")
-        self._send_cmd(f"PASSWORD {self.password}")
+class NutDevFileWriter:
+    def __init__(self, path: str):
+        self.path = path
+        self.state = dict(IDENTITY_VARS)
 
-    def _send_cmd(self, cmd: str) -> str:
-        if not self.sock:
-            self.connect()
-        self.sock.sendall((cmd + "\n").encode("utf-8"))
-        resp = self.sock.recv(1024).decode("utf-8", errors="replace").strip()
-        if resp.startswith("ERR"):
-            raise RuntimeError(f"NUT error on '{cmd}': {resp}")
-        return resp
-
-    def update_vars(self, ups_name: str, variables: dict):
+    def _load_existing(self):
+        """Seed state from whatever the entrypoint template put there."""
         try:
-            for var_name, val in variables.items():
-                self._send_cmd(f'SET VAR {ups_name} {var_name} "{val}"')
-        except (OSError, RuntimeError) as err:
-            print(f"[NUT WARN] Reconnecting to upsd ({err})...")
-            self.connect()
-            for var_name, val in variables.items():
-                self._send_cmd(f'SET VAR {ups_name} {var_name} "{val}"')
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if ":" in line:
+                        key, _, val = line.partition(":")
+                        self.state.setdefault(key.strip(), val.strip())
+        except OSError:
+            pass
 
-nut_client = NutTcpClient(NUT_HOST, NUT_PORT, NUT_USER, NUT_PASSWORD)
+    def update_vars(self, variables: dict):
+        self.state.update(variables)
+        tmp_path = f"{self.path}.tmp"
+        payload = "".join(f"{k}: {v}\n" for k, v in self.state.items())
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp_path, self.path)
+        os.utime(self.path, None)  # bump mtime: signals dummy-ups to re-read
+
+dev_writer = NutDevFileWriter(NUT_DEV_FILE)
+dev_writer._load_existing()
 
 # ==========================================
 # ANDROID-SIMULATED ECOFLOW AUTH
@@ -155,6 +155,25 @@ def get_app_mqtt_credentials() -> dict:
 # ==========================================
 # PROTOBUF WIRE PARSER & XOR DECRYPTOR
 # ==========================================
+# River 3 / R655 Protobuf Field Map
+RIVER3_FIELDS = {
+    3: ("pow_in_sum_w", "float"),
+    4: ("pow_out_sum_w", "float"),
+    8: ("ac_freq_hz", "int"),
+    54: ("pow_get_ac_in", "float"),
+    55: ("pow_get_ac_hv_out", "float"),
+    227: ("ac_out_volts", "int"),
+    242: ("bms_batt_soc", "float"),
+    255: ("bms_chg_rem_time", "int"),
+    258: ("bms_min_cell_temp", "int"),
+    259: ("bms_max_cell_temp", "int"),
+    262: ("cms_batt_soc", "float"),
+    269: ("cms_chg_rem_time", "int"),
+    281: ("bms_chg_dsg_state", "int"),
+    282: ("cms_chg_dsg_state", "int"),
+    368: ("pow_get_ac_out", "float"),
+}
+
 def _read_varint(buf: bytes, pos: int):
     val, shift = 0, 0
     while pos < len(buf):
@@ -220,25 +239,6 @@ def decode_ecoflow_protobuf(payload: bytes) -> dict:
                 metrics[name] = val
     return metrics
 
-# River 3 / R655 Protobuf Field Map
-RIVER3_FIELDS = {
-    3: ("pow_in_sum_w", "float"),
-    4: ("pow_out_sum_w", "float"),
-    8: ("ac_freq_hz", "int"),
-    54: ("pow_get_ac_in", "float"),
-    55: ("pow_get_ac_hv_out", "float"),
-    227: ("ac_out_volts", "int"),
-    242: ("bms_batt_soc", "float"),
-    255: ("bms_chg_rem_time", "int"),
-    258: ("bms_min_cell_temp", "int"),
-    259: ("bms_max_cell_temp", "int"),
-    262: ("cms_batt_soc", "float"),
-    269: ("cms_chg_rem_time", "int"),
-    281: ("bms_chg_dsg_state", "int"),
-    282: ("cms_chg_dsg_state", "int"),
-    368: ("pow_get_ac_out", "float"),
-}
-
 # ==========================================
 # MQTT BRIDGE (auto re-auth on credential expiry)
 # ==========================================
@@ -261,7 +261,7 @@ class EcoFlowMqttBridge:
         rc = int(getattr(reason_code, "value", reason_code))
         if rc == 0:
             self.connect_failures = 0
-            print("[SUCCESS] Connected to Ecoflow MQTT Broker!", flush=True)
+            print("[SUCCESS] Connected to EcoFlow MQTT Broker!", flush=True)
             user_id = userdata["userId"]
             for sn in UPS_MAPPING:
                 client.subscribe(f"/app/device/property/{sn}")
@@ -278,6 +278,14 @@ class EcoFlowMqttBridge:
         print(f"[INFO] MQTT disconnected ({reason_code}); paho will auto-reconnect with backoff.", flush=True)
 
     def on_message(self, client, userdata, msg):
+        # Never let a processing error kill the paho network thread --
+        # an unhandled exception here silently ends the loop.
+        try:
+            self._handle_message(msg)
+        except Exception as err:
+            print(f"[ERROR] Failed to process MQTT message: {err}", flush=True)
+
+    def _handle_message(self, msg):
         parts = msg.topic.split("/")
         sn = parts[-1] if msg.topic.startswith("/app/device/property/") else (parts[3] if len(parts) > 3 else None)
         if sn not in UPS_MAPPING:
@@ -303,6 +311,11 @@ class EcoFlowMqttBridge:
         freq_hz = state.get("ac_freq_hz", 50)
         temp_c = state.get("bms_max_cell_temp", 25)
 
+        # Determine standard NUT ups.status flags:
+        # OL = Online (mains power present)
+        # OB = On Battery (power outage)
+        # LB = Low Battery (triggers NUT upsmon shutdown)
+        # CHRG = Charging
         is_power_failure = (ac_in_w <= 0.5) and (dsg_state == 1)
         if is_power_failure:
             status_flags = ["OB"]
@@ -316,6 +329,7 @@ class EcoFlowMqttBridge:
         nut_vars = {
             "ups.status": " ".join(status_flags),
             "battery.charge": f"{soc}",
+            "battery.charge.low": f"{LOW_BATTERY_PCT}",
             "battery.runtime": f"{int(rem_mins * 60)}",  # NUT expects runtime in seconds
             "battery.temperature": f"{temp_c}",
             "input.voltage": f"{out_volts if ac_in_w > 0.5 else 0.0}",
@@ -326,7 +340,7 @@ class EcoFlowMqttBridge:
             "ups.load": f"{min(100, round((ac_out_w / max_watts) * 100))}",
         }
 
-        nut_client.update_vars(nut_name, nut_vars)
+        dev_writer.update_vars(nut_vars)
         print(f"[{nut_name}] status={nut_vars['ups.status']} | batt={soc}% | runtime={rem_mins}m | out={ac_out_w}W", flush=True)
 
     # ---------- client lifecycle ----------
@@ -350,12 +364,12 @@ class EcoFlowMqttBridge:
     def _fresh_credentials(self) -> dict:
         while True:
             try:
-                print("[INFO] Authenticating with Ecoflow...", flush=True)
+                print("[INFO] Authenticating with EcoFlow as Android device...", flush=True)
                 creds = get_app_mqtt_credentials()
                 print("[INFO] Obtained fresh MQTT credentials.", flush=True)
                 return creds
             except Exception as err:
-                print(f"[WARN] Ecoflow login failed: {err} - retrying in {REAUTH_RETRY_DELAY}s", flush=True)
+                print(f"[WARN] EcoFlow login failed: {err} - retrying in {REAUTH_RETRY_DELAY}s", flush=True)
                 time.sleep(REAUTH_RETRY_DELAY)
 
     def _teardown(self, client: mqtt.Client):
@@ -403,9 +417,7 @@ class EcoFlowMqttBridge:
 # MAIN
 # ==========================================
 def main():
-    print(f"[INFO] Ecoflow->NUT bridge | device={DEVICE_SN} | NUT={NUT_HOST}:{NUT_PORT}/{NUT_UPS_NAME} | LB at {LOW_BATTERY_PCT}%", flush=True)
-    print("[INFO] Connecting to local NUT upsd...", flush=True)
-    nut_client.connect()
+    print(f"[INFO] EcoFlow->NUT bridge | device={DEVICE_SN} | ups={NUT_UPS_NAME} | dev file={NUT_DEV_FILE} | LB at {LOW_BATTERY_PCT}%", flush=True)
 
     bridge = EcoFlowMqttBridge()
     try:
