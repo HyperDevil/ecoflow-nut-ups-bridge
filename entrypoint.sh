@@ -8,7 +8,7 @@ cat > /etc/nut/ups.conf <<EOF
 [ecoflow-ups]
     driver = dummy-ups
     port = /etc/nut/ecoflow-ups.dev
-    desc = "Ecoflow via MQTT bridge"
+    desc = "EcoFlow via MQTT bridge"
     pollinterval = 1
 EOF
 
@@ -53,7 +53,7 @@ EOF
 chown -R nut:nut /etc/nut /var/run/nut
 chmod 640 /etc/nut/upsd.users
 
-echo "[INIT] Starting dummy-ups driver for ecoflow ups..."
+echo "[INIT] Starting dummy-ups driver for ecoflow-ups..."
 DRIVER=$(find /usr/lib /usr/libexec -type f -name dummy-ups 2>/dev/null | head -n1)
 if [ -z "$DRIVER" ]; then
     echo "[FATAL] dummy-ups driver binary not found" >&2
@@ -74,7 +74,7 @@ until upsc ecoflow-ups@localhost >/dev/null 2>&1; do
     fi
     sleep 1
 done
-echo "[INIT] upsd is serving ecoflow ups."
+echo "[INIT] upsd is serving ecoflow-ups."
 
 echo "[INIT] Starting EcoFlow MQTT bridge..."
 exec python -u bridge.py
