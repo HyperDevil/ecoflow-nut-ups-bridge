@@ -1,0 +1,14 @@
+services:
+  ecoflow-nut-server:
+    build: https://github.com/HyperDevil/ecoflow-nut-ups-bridge.git
+    pull_policy: build
+    container_name: ecoflow-nut-ups-bridge
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3493:3493"
+    volumes:
+      - ecoflow-device-id:/data
+
+volumes:
+  ecoflow-device-id:
