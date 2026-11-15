@@ -33,7 +33,7 @@ DEVICE_UUID_FILE = env("ECOFLOW_DEVICE_UUID_FILE", os.path.expanduser("~/.ecoflo
 
 # NUT upsd TCP connection settings
 NUT_HOST     = env("NUT_HOST", "127.0.0.1")
-NUT_PORT     = int(env("NUT_PORT", "3493"))
+NUT_PORT     = int(env("NUT_PORT", "3494"))
 NUT_USER     = env("NUT_USERNAME")
 NUT_PASSWORD = env("NUT_PASSWORD")
 
