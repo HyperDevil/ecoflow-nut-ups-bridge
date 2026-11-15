@@ -30,7 +30,7 @@ EOF
 
 # ---- upsd.conf: listen on all interfaces so TrueNAS can connect ----
 cat > /etc/nut/upsd.conf <<EOF
-LISTEN 0.0.0.0 3493
+LISTEN 0.0.0.0 3494
 EOF
 
 # ---- upsd.users: one account for the bridge (SET), one for monitors ----
