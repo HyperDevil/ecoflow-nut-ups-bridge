@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "3493:3493"
+      - "3494:3493"
     volumes:
       - ecoflow-device-id:/data
 
